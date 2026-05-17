@@ -150,3 +150,54 @@ cython_debug/
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# Project data: raw experiment inputs
+data/
+raw/
+raw_data/
+local_data/
+external_data/
+videos/
+image_sequences/
+tiff_sequences/
+*.avi
+*.mp4
+*.mov
+*.mkv
+*.cine
+*.tif
+*.tiff
+
+# Project data: processed images, backgrounds, and fitting outputs
+processed/
+processed_data/
+results/
+fit_results/
+outputs/
+exports/
+backgrounds/
+norm_images/
+normalized_images/
+*.dat
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.csv
+*.tsv
+
+# Local caches and generated metadata
+.ruff_cache/
+.ipynb_checkpoints/
+*.egg-info/
+wraplorenzmie.egg-info/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+~$*
+Thumbs.db
+Desktop.ini
