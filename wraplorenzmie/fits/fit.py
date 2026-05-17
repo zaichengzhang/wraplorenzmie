@@ -3,6 +3,8 @@ from wraplorenzmie.pylorenzmie.theory import Instrument
 from wraplorenzmie.utilities.utilities import normalize
 from wraplorenzmie.utilities.utilities import crop
 from tqdm import tqdm
+from pathlib import Path
+import re
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -309,6 +311,162 @@ class fitting(object):
             self.update_guess(self.result.z_p)
         del self.fp
 
+    def fit_image_sequence(
+        self,
+        xc,
+        yc,
+        images,
+        savefile,
+        h,
+        background=None,
+        n_start=1,
+        n_end=None,
+        method="lm",
+        loss="linear",
+        dark_count_mode="min",
+        dark_count=0,
+        update_mask=True,
+        percentpix=0.1,
+        channel=1,
+        continue_on_error=True,
+    ):
+        """Fit a TIFF image sequence and write raw memmap results.
+
+        Parameters
+        ----------
+        xc, yc : int
+            Initial global particle center in pixel coordinates. The fitted
+            crop is recentered after each successful frame, matching
+            ``fit_video`` tracking behavior.
+        images : str, pathlib.Path, or sequence of paths
+            Folder containing TIFF files, or an explicit list/tuple of image
+            paths. Folder inputs include ``.tif`` and ``.tiff`` files and are
+            sorted by natural filename order, so ``image2.tif`` comes before
+            ``image10.tif``.
+        savefile : str or pathlib.Path
+            Destination for a raw ``numpy.memmap`` with ``dtype=float64``.
+        h : int
+            Side length of the square crop used for fitting.
+        background : None, scalar, array, or image path, optional
+            Background used for normalization. ``None`` uses an array of ones
+            with the same shape as each frame. Image paths are read with the
+            same TIFF reader and channel handling as sequence frames.
+        n_start, n_end : int, optional
+            One-based frame-number range to fit. ``n_start`` is inclusive and
+            defaults to 1, so frame 1 is the first image in the naturally
+            sorted list. ``n_end`` is one-based and exclusive. If ``n_end`` is
+            ``None``, it is set to ``number_of_images + 1`` so the default
+            call processes every image. Internally, frame number ``k`` reads
+            ``image_paths[k - 1]``.
+        method, loss : str
+            Passed to the existing optimizer settings, preserving the same
+            fitting parameter selection mechanism as ``fit_video``.
+        dark_count_mode : {"min", "zero", "set"}
+            Dark-count handling for normalization. ``"min"`` uses the minimum
+            value in the current cropped frame, ``"zero"`` uses 0, and
+            ``"set"`` uses ``dark_count``.
+        dark_count : float
+            Dark-count value used when ``dark_count_mode="set"``.
+        update_mask : bool
+            If true, refresh the existing feature mask before each fit.
+        percentpix : float
+            Fraction of pixels selected by the existing mask.
+        channel : int or None
+            Channel used for RGB/RGBA TIFFs. The default is 1, matching the
+            current ``video_reader`` behavior. ``None`` keeps the array as-is
+            and requires it to be two-dimensional.
+        continue_on_error : bool
+            If true, failed frames are recorded as failure rows and fitting
+            continues. If false, the first frame error is re-raised after
+            restoring the last successful fitting state.
+
+        Output format
+        -------------
+        Results are written frame-by-frame to a raw ``numpy.memmap`` with
+        shape ``(n_end - n_start, len(optimizer.variables) * 2 + 3)``. Columns
+        are ``variables + d<variable> uncertainty columns + success + npix +
+        redchi``, exactly like ``fit_video``.
+
+        Failure handling
+        ----------------
+        If a frame cannot be read, normalized, or fitted, this method writes a
+        row with NaN parameter/uncertainty values, ``success=0``, and NaN
+        statistics, flushes the memmap, restores the last successful model
+        properties and crop-center state, and continues with the next frame
+        when ``continue_on_error=True``. Only successful frames update the crop
+        center and initial guess for subsequent frames.
+        """
+        image_paths = self._image_sequence_paths(images)
+        if n_end is None:
+            n_end = len(image_paths) + 1
+        if n_start < 1 or n_end < n_start or n_end > len(image_paths) + 1:
+            raise ValueError(
+                "n_start and n_end must define a valid 1-based frame range"
+            )
+
+        self.xc = int(xc)
+        self.yc = int(yc)
+        self.h = h
+        self.feature.mask.percentpix = percentpix
+        variables = self.feature.optimizer.variables
+        width = len(variables) * 2 + 3
+        background_image = self._load_sequence_background(background, channel)
+        last_good_properties = self.feature.model.properties.copy()
+        last_good_xc = self.xc
+        last_good_yc = self.yc
+        last_good_h = self.h
+        last_good_result = getattr(self, "result", None)
+
+        mm = np.memmap(
+            savefile,
+            dtype="float64",
+            mode="w+",
+            shape=(int(n_end - n_start), width),
+        )
+        self.fp = mm
+        try:
+            for row, frame_number in enumerate(tqdm(range(n_start, n_end))):
+                try:
+                    frame = self._read_sequence_image(
+                        image_paths[frame_number - 1], channel
+                    )
+                    bg = self._background_for_frame(background_image, frame)
+                    image = self._normalize_sequence_frame(
+                        frame, bg, dark_count_mode, dark_count
+                    )
+
+                    if update_mask:
+                        self.feature.mask._update()
+
+                    self.feature.data = image
+                    self.result = self.optimize(method=method, loss=loss)
+                    if not bool(self.result["success"]):
+                        raise RuntimeError("optimizer did not converge")
+
+                    self._globalize_result()
+                    mm[row, :] = self._result_row()
+                    mm.flush()
+                    self.update_guess(self.result.z_p)
+                    last_good_properties = self.feature.model.properties.copy()
+                    last_good_xc = self.xc
+                    last_good_yc = self.yc
+                    last_good_h = self.h
+                    last_good_result = self.result
+                except Exception:
+                    self.feature.model.properties = last_good_properties.copy()
+                    self.xc = last_good_xc
+                    self.yc = last_good_yc
+                    self.h = last_good_h
+                    if last_good_result is not None:
+                        self.result = last_good_result
+                    if not continue_on_error:
+                        raise
+                    mm[row, :] = self._failed_result_row(width)
+                    mm.flush()
+        finally:
+            del self.fp
+            del mm
+
     def show_results(self):
         fit = self.fitter.model.hologram().reshape(self.shape)
         noise = self.fitter.noise
@@ -328,6 +486,95 @@ class fitting(object):
         for i in self.result[variables_to_save]:
             buf = np.append(buf, i)
         self.fp[n, :] = buf
+
+    def _save_failed_result(self, n, width):
+        self.fp[n, :] = self._failed_result_row(width)
+
+    def _result_row(self):
+        buf = np.array([])
+        variables_to_save = self.feature.optimizer.variables + ['d' + x for x in self.feature.optimizer.variables] + ['success', 'npix', 'redchi']
+        for i in self.result[variables_to_save]:
+            buf = np.append(buf, i)
+        return buf
+
+    def _failed_result_row(self, width):
+        buf = np.full(width, np.nan)
+        buf[-3] = 0
+        return buf
+
+    def _normalize_sequence_frame(
+        self, frame, background, dark_count_mode="min", dark_count=0
+    ):
+        cropped = self._crop_fit(frame)
+        cropped_background = self._crop_fit(background)
+        if dark_count_mode == "min":
+            count = np.min(cropped)
+        elif dark_count_mode == "zero":
+            count = 0
+        elif dark_count_mode == "set":
+            count = dark_count
+        else:
+            raise ValueError("dark_count_mode should be 'min', 'zero', or 'set'")
+
+        image = normalize(cropped, cropped_background, dark_count=count)
+        return image / np.mean(image)
+
+    def _background_for_frame(self, background, frame):
+        if background is None:
+            return np.ones_like(frame)
+        if np.isscalar(background):
+            return np.full_like(frame, background, dtype=float)
+        return background
+
+    def _load_sequence_background(self, background, channel):
+        if background is None or np.isscalar(background):
+            return background
+        if isinstance(background, (str, Path)):
+            return self._read_sequence_image(background, channel)
+        return np.asarray(background)
+
+    def _image_sequence_paths(self, images):
+        if isinstance(images, (str, Path)):
+            root = Path(images)
+            if root.is_dir():
+                paths = [
+                    path
+                    for path in root.iterdir()
+                    if path.suffix.lower() in [".tif", ".tiff"]
+                ]
+            else:
+                paths = [root]
+        else:
+            paths = [Path(path) for path in images]
+
+        paths = [path for path in paths if path.suffix.lower() in [".tif", ".tiff"]]
+        paths = sorted(paths, key=lambda path: self._natural_sort_key(path.name))
+        if not paths:
+            raise ValueError("No .tif or .tiff images were found")
+        return paths
+
+    def _natural_sort_key(self, value):
+        return [
+            int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", value)
+        ]
+
+    def _read_sequence_image(self, path, channel=1):
+        try:
+            import tifffile
+
+            image = tifffile.imread(path)
+        except ImportError:
+            import imageio
+
+            image = imageio.imread(path)
+
+        image = np.asarray(image)
+        if image.ndim == 2:
+            return image
+        if image.ndim == 3 and channel is not None:
+            return image[:, :, channel]
+        raise ValueError("Expected a 2D grayscale image or RGB/RGBA image")
 
 
 def globalize_result(result, xc, yc, h):
